@@ -6,3 +6,5 @@
 */.idea/
 */__pycache__/
 python/data/
+data/
+downloads/
