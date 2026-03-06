@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import csv
 import io
 import re
 from zipfile import ZipFile
+
+import pandas as pd
 
 from data_processing.kline_constants import KLINE_COLUMNS
 
@@ -21,6 +22,7 @@ class ExtractConfig:
     source_dir: Path | None = None
     output_dir: Path | None = None
     overwrite_existing: bool = True
+    read_chunk_size: int = 200_000
 
 
 @dataclass
@@ -69,31 +71,68 @@ def select_zip_files(source_dir: Path, symbol: str, interval: str) -> list[tuple
     return selected
 
 
+def _iter_member_chunks(
+    zf: ZipFile,
+    member_name: str,
+    chunk_size: int,
+):
+    with zf.open(member_name, "r") as src_bin:
+        text_stream = io.TextIOWrapper(src_bin, encoding="utf-8", newline="")
+        try:
+            reader = pd.read_csv(
+                text_stream,
+                header=None,
+                names=KLINE_COLUMNS,
+                dtype=str,
+                keep_default_na=False,
+                na_filter=False,
+                chunksize=chunk_size,
+            )
+        except pd.errors.EmptyDataError:
+            return
+
+        first_chunk = True
+        try:
+            for chunk in reader:
+                if first_chunk:
+                    first_chunk = False
+                    if not chunk.empty and chunk.iloc[0].tolist() == KLINE_COLUMNS:
+                        chunk = chunk.iloc[1:].reset_index(drop=True)
+                yield chunk
+        except pd.errors.EmptyDataError:
+            return
+
+
 def _write_csv_with_header(
     zf: ZipFile,
     member_name: str,
     output_csv_path: Path,
+    chunk_size: int,
 ) -> None:
-    with zf.open(member_name, "r") as src_bin, output_csv_path.open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as dst:
-        reader = csv.reader(io.TextIOWrapper(src_bin, encoding="utf-8"))
-        writer = csv.writer(dst)
-        writer.writerow(KLINE_COLUMNS)
+    wrote_rows = False
+    for chunk in _iter_member_chunks(zf, member_name, chunk_size):
+        chunk.to_csv(
+            output_csv_path,
+            mode="w" if not wrote_rows else "a",
+            index=False,
+            header=not wrote_rows,
+            lineterminator="\n",
+        )
+        wrote_rows = True
 
-        first_row = next(reader, None)
-        if first_row is not None:
-            # Most Binance files do not include a header. If one exists, do not duplicate it.
-            if first_row != KLINE_COLUMNS:
-                writer.writerow(first_row)
-            for row in reader:
-                writer.writerow(row)
+    if not wrote_rows:
+        pd.DataFrame(columns=KLINE_COLUMNS).to_csv(
+            output_csv_path,
+            index=False,
+            lineterminator="\n",
+        )
 
 
 def extract_monthly_klines(config: ExtractConfig) -> ExtractResult:
     """Extract all monthly ZIP files in source_dir and restore CSV headers."""
+    if config.read_chunk_size <= 0:
+        raise ValueError("read_chunk_size must be > 0.")
+
     project_root = resolve_project_root(config.project_root)
     source_dir = config.source_dir or build_source_dir(project_root, config.symbol, config.interval)
     output_dir = config.output_dir or build_output_dir(project_root)
@@ -123,7 +162,7 @@ def extract_monthly_klines(config: ExtractConfig) -> ExtractResult:
                     extracted_csv_paths.append(output_csv_path)
                     continue
 
-                _write_csv_with_header(zf, member, output_csv_path)
+                _write_csv_with_header(zf, member, output_csv_path, config.read_chunk_size)
                 extracted_csv_paths.append(output_csv_path)
 
     return ExtractResult(
@@ -133,4 +172,3 @@ def extract_monthly_klines(config: ExtractConfig) -> ExtractResult:
         selected_zips=[item[2] for item in selected],
         extracted_csv_paths=extracted_csv_paths,
     )
-

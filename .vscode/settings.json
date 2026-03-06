@@ -1,4 +1,7 @@
 {
+    "python.condaPath": "/home/vincent-4090/miniconda3/bin/conda",
+    "python.defaultInterpreterPath": "/home/vincent-4090/miniconda3/envs/tsf_data/bin/python",
+    "python.terminal.activateEnvironment": true,
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda"
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,8 +11,26 @@ import csv
 import itertools
 import re
 
+import pandas as pd
+
 from data_processing.kline_constants import KLINE_COLUMNS
 from data_processing.process_klines_monthly_logic import resolve_project_root
+
+
+INT_COLUMNS = {"Open time", "Close time", "Number of trades", "Ignore"}
+FLOAT_COLUMNS = {
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume",
+    "Quote asset volume",
+    "Taker buy base asset volume",
+    "Taker buy quote asset volume",
+}
+TIMESTAMP_COLUMNS = {"Open time", "Close time"}
+FLOAT_NAN_LITERALS = {"nan", "+nan", "-nan"}
+TIMESTAMP_RESOLUTION_US = {"us": 1, "ms": 1000, "s": 1_000_000}
 
 
 @dataclass
@@ -31,6 +50,8 @@ class CombineConfig:
     column_renames: dict[str, str] = field(default_factory=dict)
     parquet_compression: str = "snappy"
     parquet_chunk_size: int = 200_000
+    read_chunk_size: int = 200_000
+    datetime_columns_to_utc: list[str] = field(default_factory=list)
     max_examples_per_issue: int = 15
 
 
@@ -44,6 +65,7 @@ class CombineResult:
     selected_columns: list[str]
     selected_source_columns: list[str]
     column_renames_applied: dict[str, str]
+    datetime_columns_converted: list[str]
     selected_csvs: list[Path]
     files_processed: int
     rows_read: int
@@ -98,8 +120,7 @@ def parse_timestamp_to_us(raw_value: str) -> tuple[int | None, str]:
 
 
 def timestamp_unit_resolution_us(unit: str | None) -> int | None:
-    mapping = {"us": 1, "ms": 1000, "s": 1_000_000}
-    return mapping.get(unit) if unit is not None else None
+    return TIMESTAMP_RESOLUTION_US.get(unit) if unit is not None else None
 
 
 def resolve_output_columns(
@@ -170,31 +191,34 @@ def resolve_renamed_columns(
     return output_columns, applied
 
 
-def coerce_for_parquet(column_name: str, value: str):
-    int_cols = {"Open time", "Close time", "Number of trades", "Ignore"}
-    float_cols = {
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Volume",
-        "Quote asset volume",
-        "Taker buy base asset volume",
-        "Taker buy quote asset volume",
-    }
-    if value == "" or value is None:
-        return None
-    if column_name in int_cols:
-        try:
-            return int(value)
-        except ValueError:
-            return None
-    if column_name in float_cols:
-        try:
-            return float(value)
-        except ValueError:
-            return None
-    return value
+def resolve_datetime_columns(
+    selected_source_columns: list[str],
+    output_columns: list[str],
+    datetime_columns_to_utc: list[str],
+) -> list[str]:
+    converted = [col for col in datetime_columns_to_utc]
+    if len(converted) != len(set(converted)):
+        raise ValueError("datetime_columns_to_utc contains duplicates.")
+
+    unknown = [col for col in converted if col not in output_columns]
+    if unknown:
+        raise ValueError(
+            "datetime_columns_to_utc can only reference output columns. "
+            f"Unknown columns: {unknown}"
+        )
+
+    invalid = [
+        output_col
+        for source_col, output_col in zip(selected_source_columns, output_columns)
+        if output_col in converted and source_col not in TIMESTAMP_COLUMNS
+    ]
+    if invalid:
+        raise ValueError(
+            "datetime_columns_to_utc can only be used with Open time or Close time columns. "
+            f"Invalid columns: {invalid}"
+        )
+
+    return converted
 
 
 def default_extracted_dir(project_root: Path) -> Path:
@@ -239,6 +263,120 @@ def select_extracted_csvs(
     return selected
 
 
+def parse_integral_series(raw: pd.Series) -> tuple[pd.Series, pd.Series]:
+    normalized = raw.str.strip()
+    valid_mask = normalized.str.fullmatch(r"[+-]?\d+")
+    parsed = pd.Series(pd.NA, index=raw.index, dtype="Int64")
+    if valid_mask.any():
+        parsed.loc[valid_mask] = normalized.loc[valid_mask].astype("int64")
+    parse_error_mask = ~valid_mask
+    return parsed, parse_error_mask
+
+
+def normalize_timestamp_series(raw: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    parsed, parse_error_mask = parse_integral_series(raw)
+    normalized = pd.Series(pd.NA, index=raw.index, dtype="Int64")
+    units = pd.Series([None] * len(raw), index=raw.index, dtype="object")
+
+    valid_mask = ~parse_error_mask
+    if valid_mask.any():
+        values = parsed.loc[valid_mask].astype("int64")
+
+        us_index = values.index[values >= 10**15]
+        ms_index = values.index[(values >= 10**12) & (values < 10**15)]
+        s_index = values.index[(values >= 10**9) & (values < 10**12)]
+        unknown_index = values.index[values < 10**9]
+
+        if len(us_index) > 0:
+            normalized.loc[us_index] = values.loc[us_index].to_numpy()
+            units.loc[us_index] = "us"
+        if len(ms_index) > 0:
+            normalized.loc[ms_index] = (values.loc[ms_index] * 1000).to_numpy()
+            units.loc[ms_index] = "ms"
+        if len(s_index) > 0:
+            normalized.loc[s_index] = (values.loc[s_index] * 1_000_000).to_numpy()
+            units.loc[s_index] = "s"
+        if len(unknown_index) > 0:
+            units.loc[unknown_index] = "unknown"
+
+    return normalized, units, parse_error_mask
+
+
+def parse_float_series(raw: pd.Series) -> tuple[pd.Series, pd.Series]:
+    normalized = raw.str.strip()
+    numeric = pd.to_numeric(normalized, errors="coerce")
+    nan_literals = normalized.str.lower().isin(FLOAT_NAN_LITERALS)
+    parse_error_mask = numeric.isna() & ~nan_literals
+    return numeric, parse_error_mask
+
+
+def record_issue_matches(
+    issue_counts: Counter,
+    issue_examples: defaultdict[str, list[str]],
+    issue_key: str,
+    match_mask: pd.Series,
+    detail_builder: Callable[[int], str],
+    max_examples_per_issue: int,
+) -> None:
+    normalized_mask = match_mask.fillna(False)
+    match_index = normalized_mask[normalized_mask].index
+    count = len(match_index)
+    if count == 0:
+        return
+
+    issue_counts[issue_key] += count
+    remaining = max_examples_per_issue - len(issue_examples[issue_key])
+    if remaining <= 0:
+        return
+
+    for idx in match_index[:remaining]:
+        issue_examples[issue_key].append(detail_builder(int(idx)))
+
+
+def build_parquet_schema(
+    pa,
+    selected_source_columns: list[str],
+    output_columns: list[str],
+    datetime_columns_to_utc: list[str],
+):
+    parquet_field_types = []
+    datetime_columns = set(datetime_columns_to_utc)
+    for source_col, output_col in zip(selected_source_columns, output_columns):
+        if output_col in datetime_columns:
+            parquet_field_types.append((output_col, pa.timestamp("us", tz="UTC")))
+        elif source_col in INT_COLUMNS:
+            parquet_field_types.append((output_col, pa.int64()))
+        elif source_col in FLOAT_COLUMNS:
+            parquet_field_types.append((output_col, pa.float64()))
+        else:
+            parquet_field_types.append((output_col, pa.string()))
+    return pa.schema(parquet_field_types)
+
+
+def coerce_output_chunk_for_parquet(
+    output_chunk: pd.DataFrame,
+    selected_source_columns: list[str],
+    output_columns: list[str],
+    datetime_columns_to_utc: list[str],
+) -> pd.DataFrame:
+    parquet_chunk = output_chunk.copy()
+    datetime_columns = set(datetime_columns_to_utc)
+
+    for source_col, output_col in zip(selected_source_columns, output_columns):
+        if output_col in datetime_columns:
+            continue
+        if source_col in INT_COLUMNS:
+            parsed, _ = parse_integral_series(parquet_chunk[output_col].astype(str))
+            parquet_chunk[output_col] = parsed
+        elif source_col in FLOAT_COLUMNS:
+            parsed, _ = parse_float_series(parquet_chunk[output_col].astype(str))
+            parquet_chunk[output_col] = parsed
+        else:
+            parquet_chunk[output_col] = parquet_chunk[output_col].astype("string")
+
+    return parquet_chunk
+
+
 def _build_summary_lines(
     config: CombineConfig,
     extracted_dir: Path,
@@ -247,6 +385,7 @@ def _build_summary_lines(
     selected_source_columns: list[str],
     output_columns: list[str],
     column_renames_applied: dict[str, str],
+    datetime_columns_converted: list[str],
     selected_csvs: list[tuple[datetime, int, str, Path]],
     files_processed: int,
     rows_total: int,
@@ -271,9 +410,12 @@ def _build_summary_lines(
         f"OUTPUT_PATH={combined_output_path}",
         f"SUMMARY_LOG_PATH={summary_log_path}",
         f"EXPECTED_INTERVAL_US={expected_interval_us}",
+        f"READ_CHUNK_SIZE={config.read_chunk_size}",
+        f"PARQUET_CHUNK_SIZE={config.parquet_chunk_size}",
         f"SELECTED_SOURCE_COLUMNS={selected_source_columns}",
         f"OUTPUT_COLUMNS={output_columns}",
         f"COLUMN_RENAMES_APPLIED={column_renames_applied}",
+        f"DATETIME_COLUMNS_TO_UTC={datetime_columns_converted}",
         "",
         "[Run Stats]",
         f"FILES_SELECTED={len(selected_csvs)}",
@@ -307,6 +449,11 @@ def _build_summary_lines(
 
 
 def combine_extracted_klines(config: CombineConfig) -> CombineResult:
+    if config.read_chunk_size <= 0:
+        raise ValueError("read_chunk_size must be > 0.")
+    if config.parquet_chunk_size <= 0:
+        raise ValueError("parquet_chunk_size must be > 0.")
+
     project_root = resolve_project_root(config.project_root)
     extracted_dir_override = resolve_override_path(project_root, config.extracted_dir)
     output_dir_override = resolve_override_path(project_root, config.output_dir)
@@ -331,6 +478,11 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
     output_columns, column_renames_applied = resolve_renamed_columns(
         selected_columns=selected_source_columns,
         column_renames=config.column_renames,
+    )
+    datetime_columns_converted = resolve_datetime_columns(
+        selected_source_columns=selected_source_columns,
+        output_columns=output_columns,
+        datetime_columns_to_utc=config.datetime_columns_to_utc,
     )
     selected_csvs = select_extracted_csvs(
         extracted_dir=extracted_dir,
@@ -372,236 +524,404 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
         if len(issue_examples[issue_key]) < config.max_examples_per_issue:
             issue_examples[issue_key].append(detail)
 
-    csv_writer = None
-    csv_handle = None
-    parquet_writer = None
-    parquet_schema = None
-    parquet_buffer = None
-    buffer_size = 0
+    def iter_valid_row_chunks(csv_path: Path):
+        nonlocal rows_total
 
-    try:
-        if output_format == "csv":
-            csv_handle = combined_output_path.open("w", newline="", encoding="utf-8")
-            csv_writer = csv.writer(csv_handle)
-            csv_writer.writerow(output_columns)
-        else:
-            try:
-                import pyarrow as pa
-                import pyarrow.parquet as pq
-            except ImportError as exc:
-                raise ImportError("Parquet output requires pyarrow. Install it, then rerun.") from exc
+        with csv_path.open("r", newline="", encoding="utf-8") as src:
+            reader = csv.reader(src)
+            first_row = next(reader, None)
+            if first_row is None:
+                record_issue("empty_file", f"{csv_path.name}: file has no rows")
+                return
 
-            parquet_field_types = []
-            for source_col, output_col in zip(selected_source_columns, output_columns):
-                if source_col in {"Open time", "Close time", "Number of trades", "Ignore"}:
-                    parquet_field_types.append((output_col, pa.int64()))
-                elif source_col in {
-                    "Open",
-                    "High",
-                    "Low",
-                    "Close",
-                    "Volume",
-                    "Quote asset volume",
-                    "Taker buy base asset volume",
-                    "Taker buy quote asset volume",
-                }:
-                    parquet_field_types.append((output_col, pa.float64()))
-                else:
-                    parquet_field_types.append((output_col, pa.string()))
+            file_row_idx = 0
+            row_buffer: list[list[str]] = []
+            row_number_buffer: list[int] = []
 
-            parquet_schema = pa.schema(parquet_field_types)
-            parquet_writer = pq.ParquetWriter(
-                str(combined_output_path),
-                parquet_schema,
-                compression=config.parquet_compression,
-            )
-            parquet_buffer = {col: [] for col in output_columns}
+            def flush_buffer():
+                nonlocal row_buffer, row_number_buffer
+                if not row_buffer:
+                    return None
 
-        prev_open_time_us = None
+                chunk = pd.DataFrame(row_buffer, columns=KLINE_COLUMNS)
+                file_row_numbers = pd.Series(row_number_buffer, index=chunk.index, dtype="int64")
+                row_buffer = []
+                row_number_buffer = []
+                return chunk, file_row_numbers
 
-        for _, _, _, csv_path in selected_csvs:
-            files_processed += 1
-            with csv_path.open("r", newline="", encoding="utf-8") as src:
-                reader = csv.reader(src)
-                first_row = next(reader, None)
-                if first_row is None:
-                    record_issue("empty_file", f"{csv_path.name}: file has no rows")
+            if first_row == KLINE_COLUMNS:
+                row_source = reader
+            else:
+                record_issue(
+                    "missing_or_unexpected_header",
+                    f"{csv_path.name}: first row is not expected header",
+                )
+                row_source = itertools.chain([first_row], reader)
+
+            for row in row_source:
+                file_row_idx += 1
+                rows_total += 1
+
+                if len(row) != len(KLINE_COLUMNS):
+                    record_issue(
+                        "malformed_row_column_count",
+                        f"{csv_path.name}:{file_row_idx} has {len(row)} columns (expected {len(KLINE_COLUMNS)})",
+                    )
                     continue
 
-                if first_row == KLINE_COLUMNS:
-                    row_iter = reader
-                else:
-                    record_issue(
-                        "missing_or_unexpected_header",
-                        f"{csv_path.name}: first row is not expected header",
+                row_buffer.append(row)
+                row_number_buffer.append(file_row_idx)
+
+                if len(row_buffer) >= config.read_chunk_size:
+                    flushed = flush_buffer()
+                    if flushed is not None:
+                        yield flushed
+
+            flushed = flush_buffer()
+            if flushed is not None:
+                yield flushed
+
+    if output_format == "csv":
+        pd.DataFrame(columns=output_columns).to_csv(
+            combined_output_path,
+            index=False,
+            lineterminator="\n",
+        )
+        parquet_writer = None
+        parquet_schema = None
+        wrote_parquet_rows = False
+    else:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise ImportError("Parquet output requires pyarrow. Install it, then rerun.") from exc
+
+        parquet_schema = build_parquet_schema(
+            pa=pa,
+            selected_source_columns=selected_source_columns,
+            output_columns=output_columns,
+            datetime_columns_to_utc=datetime_columns_converted,
+        )
+        parquet_writer = pq.ParquetWriter(
+            str(combined_output_path),
+            parquet_schema,
+            compression=config.parquet_compression,
+        )
+        wrote_parquet_rows = False
+
+    prev_open_time_us: int | None = None
+
+    try:
+        for _, _, _, csv_path in selected_csvs:
+            files_processed += 1
+
+            for chunk_df, file_row_numbers in iter_valid_row_chunks(csv_path):
+                file_name = csv_path.name
+
+                open_raw = chunk_df["Open time"]
+                close_raw = chunk_df["Close time"]
+
+                open_us, open_units, open_parse_error = normalize_timestamp_series(open_raw)
+                close_us, close_units, close_parse_error = normalize_timestamp_series(close_raw)
+
+                timestamp_units.update(unit for unit in open_units.dropna().tolist())
+                timestamp_units.update(unit for unit in close_units.dropna().tolist())
+
+                def row_ref(idx: int) -> str:
+                    return f"{file_name}:{int(file_row_numbers.loc[idx])}"
+
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "open_time_parse_error",
+                    open_parse_error,
+                    lambda idx: f"{row_ref(idx)} open_time={open_raw.loc[idx]}",
+                    config.max_examples_per_issue,
+                )
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "close_time_parse_error",
+                    close_parse_error,
+                    lambda idx: f"{row_ref(idx)} close_time={close_raw.loc[idx]}",
+                    config.max_examples_per_issue,
+                )
+
+                open_unknown_mask = open_units == "unknown"
+                close_unknown_mask = close_units == "unknown"
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "open_time_unknown_unit",
+                    open_unknown_mask,
+                    lambda idx: f"{row_ref(idx)} open_time={open_raw.loc[idx]}",
+                    config.max_examples_per_issue,
+                )
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "close_time_unknown_unit",
+                    close_unknown_mask,
+                    lambda idx: f"{row_ref(idx)} close_time={close_raw.loc[idx]}",
+                    config.max_examples_per_issue,
+                )
+
+                valid_open_mask = open_us.notna()
+                if valid_open_mask.any():
+                    valid_open_us = open_us.loc[valid_open_mask].astype("int64")
+                    prev_values = valid_open_us.shift(1)
+                    if prev_open_time_us is not None:
+                        prev_values.iloc[0] = prev_open_time_us
+
+                    comparable = prev_values.notna()
+                    deltas = valid_open_us - prev_values
+
+                    timestamp_decrease_mask = comparable & (deltas < 0)
+                    timestamp_duplicate_mask = comparable & (deltas == 0)
+
+                    record_issue_matches(
+                        issue_counts,
+                        issue_examples,
+                        "timestamp_decrease",
+                        timestamp_decrease_mask,
+                        lambda idx: f"{row_ref(idx)} delta_us={int(deltas.loc[idx])}",
+                        config.max_examples_per_issue,
                     )
-                    row_iter = itertools.chain([first_row], reader)
+                    record_issue_matches(
+                        issue_counts,
+                        issue_examples,
+                        "timestamp_duplicate",
+                        timestamp_duplicate_mask,
+                        lambda idx: f"{row_ref(idx)} duplicate open time",
+                        config.max_examples_per_issue,
+                    )
 
-                for file_row_idx, row in enumerate(row_iter, start=1):
-                    rows_total += 1
-                    if len(row) != len(KLINE_COLUMNS):
-                        record_issue(
-                            "malformed_row_column_count",
-                            f"{csv_path.name}:{file_row_idx} has {len(row)} columns (expected {len(KLINE_COLUMNS)})",
+                    if expected_interval_us is not None:
+                        positive_delta_mask = comparable & (deltas > 0)
+                        timestamp_step_mismatch_mask = positive_delta_mask & (deltas != expected_interval_us)
+                        timestamp_gap_mask = timestamp_step_mismatch_mask & (deltas > expected_interval_us)
+                        timestamp_overlap_mask = timestamp_step_mismatch_mask & (deltas < expected_interval_us)
+
+                        record_issue_matches(
+                            issue_counts,
+                            issue_examples,
+                            "timestamp_step_mismatch",
+                            timestamp_step_mismatch_mask,
+                            lambda idx: (
+                                f"{row_ref(idx)} delta_us={int(deltas.loc[idx])}, "
+                                f"expected={expected_interval_us}"
+                            ),
+                            config.max_examples_per_issue,
                         )
+                        record_issue_matches(
+                            issue_counts,
+                            issue_examples,
+                            "timestamp_gap",
+                            timestamp_gap_mask,
+                            lambda idx: (
+                                f"{row_ref(idx)} gap_us={int(deltas.loc[idx]) - expected_interval_us}"
+                            ),
+                            config.max_examples_per_issue,
+                        )
+                        record_issue_matches(
+                            issue_counts,
+                            issue_examples,
+                            "timestamp_overlap",
+                            timestamp_overlap_mask,
+                            lambda idx: (
+                                f"{row_ref(idx)} overlap_us={expected_interval_us - int(deltas.loc[idx])}"
+                            ),
+                            config.max_examples_per_issue,
+                        )
+
+                    prev_open_time_us = int(valid_open_us.iloc[-1])
+
+                open_close_unit_mismatch_mask = open_units.notna() & close_units.notna() & (open_units != close_units)
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "open_close_time_unit_mismatch",
+                    open_close_unit_mismatch_mask,
+                    lambda idx: (
+                        f"{row_ref(idx)} open_unit={open_units.loc[idx]}, close_unit={close_units.loc[idx]}"
+                    ),
+                    config.max_examples_per_issue,
+                )
+
+                both_valid_mask = open_us.notna() & close_us.notna()
+                if both_valid_mask.any():
+                    valid_pair_index = both_valid_mask[both_valid_mask].index
+                    open_us_valid = open_us.loc[valid_pair_index].astype("int64")
+                    close_us_valid = close_us.loc[valid_pair_index].astype("int64")
+
+                    close_before_open_mask = close_us_valid < open_us_valid
+                    record_issue_matches(
+                        issue_counts,
+                        issue_examples,
+                        "close_before_open",
+                        close_before_open_mask,
+                        lambda idx: (
+                            f"{row_ref(idx)} open_us={int(open_us_valid.loc[idx])}, "
+                            f"close_us={int(close_us_valid.loc[idx])}"
+                        ),
+                        config.max_examples_per_issue,
+                    )
+
+                    if expected_interval_us is not None:
+                        open_resolution = open_units.map(TIMESTAMP_RESOLUTION_US).loc[valid_pair_index].astype("int64")
+                        close_resolution = close_units.map(TIMESTAMP_RESOLUTION_US).loc[valid_pair_index].astype("int64")
+                        resolution_us = pd.concat([open_resolution, close_resolution], axis=1).max(axis=1)
+                        expected_close = open_us_valid + expected_interval_us - resolution_us
+                        close_time_mismatch_mask = close_us_valid != expected_close
+
+                        record_issue_matches(
+                            issue_counts,
+                            issue_examples,
+                            "close_time_mismatch",
+                            close_time_mismatch_mask,
+                            lambda idx: (
+                                f"{row_ref(idx)} close_us={int(close_us_valid.loc[idx])}, "
+                                f"expected_close={int(expected_close.loc[idx])}, "
+                                f"resolution_us={int(resolution_us.loc[idx])}"
+                            ),
+                            config.max_examples_per_issue,
+                        )
+
+                open_price, open_price_parse_error = parse_float_series(chunk_df["Open"])
+                high_price, high_price_parse_error = parse_float_series(chunk_df["High"])
+                low_price, low_price_parse_error = parse_float_series(chunk_df["Low"])
+                close_price, close_price_parse_error = parse_float_series(chunk_df["Close"])
+
+                ohlc_parse_error_mask = (
+                    open_price_parse_error
+                    | high_price_parse_error
+                    | low_price_parse_error
+                    | close_price_parse_error
+                )
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "ohlc_parse_error",
+                    ohlc_parse_error_mask,
+                    lambda idx: f"{row_ref(idx)} open/high/low/close parse failed",
+                    config.max_examples_per_issue,
+                )
+
+                ohlc_valid_mask = ~ohlc_parse_error_mask
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "ohlc_high_below_low",
+                    ohlc_valid_mask & (high_price < low_price),
+                    lambda idx: f"{row_ref(idx)} high={high_price.loc[idx]}, low={low_price.loc[idx]}",
+                    config.max_examples_per_issue,
+                )
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "ohlc_high_inconsistent",
+                    ohlc_valid_mask & (high_price < pd.concat([open_price, close_price, low_price], axis=1).max(axis=1)),
+                    lambda idx: (
+                        f"{row_ref(idx)} open={open_price.loc[idx]}, high={high_price.loc[idx]}, "
+                        f"low={low_price.loc[idx]}, close={close_price.loc[idx]}"
+                    ),
+                    config.max_examples_per_issue,
+                )
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "ohlc_low_inconsistent",
+                    ohlc_valid_mask & (low_price > pd.concat([open_price, close_price, high_price], axis=1).min(axis=1)),
+                    lambda idx: (
+                        f"{row_ref(idx)} open={open_price.loc[idx]}, high={high_price.loc[idx]}, "
+                        f"low={low_price.loc[idx]}, close={close_price.loc[idx]}"
+                    ),
+                    config.max_examples_per_issue,
+                )
+
+                volume_values, volume_parse_error = parse_float_series(chunk_df["Volume"])
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "volume_parse_error",
+                    volume_parse_error,
+                    lambda idx: row_ref(idx),
+                    config.max_examples_per_issue,
+                )
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "negative_volume",
+                    (~volume_parse_error) & (volume_values < 0),
+                    lambda idx: row_ref(idx),
+                    config.max_examples_per_issue,
+                )
+
+                trade_values, trades_parse_error = parse_integral_series(chunk_df["Number of trades"])
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "trades_parse_error",
+                    trades_parse_error,
+                    lambda idx: row_ref(idx),
+                    config.max_examples_per_issue,
+                )
+                record_issue_matches(
+                    issue_counts,
+                    issue_examples,
+                    "negative_trade_count",
+                    (~trades_parse_error) & (trade_values < 0),
+                    lambda idx: row_ref(idx),
+                    config.max_examples_per_issue,
+                )
+
+                output_chunk = chunk_df.loc[:, selected_source_columns].copy()
+                output_chunk.columns = output_columns
+
+                for source_col, output_col in zip(selected_source_columns, output_columns):
+                    if output_col not in datetime_columns_converted:
                         continue
+                    source_us = open_us if source_col == "Open time" else close_us
+                    output_chunk[output_col] = pd.to_datetime(
+                        source_us.astype("float64"),
+                        unit="us",
+                        utc=True,
+                        errors="coerce",
+                    )
 
-                    row_map = dict(zip(KLINE_COLUMNS, row))
+                if output_format == "csv":
+                    output_chunk.to_csv(
+                        combined_output_path,
+                        mode="a",
+                        index=False,
+                        header=False,
+                        lineterminator="\n",
+                    )
+                else:
+                    parquet_chunk = coerce_output_chunk_for_parquet(
+                        output_chunk=output_chunk,
+                        selected_source_columns=selected_source_columns,
+                        output_columns=output_columns,
+                        datetime_columns_to_utc=datetime_columns_converted,
+                    )
+                    table = pa.Table.from_pandas(
+                        parquet_chunk,
+                        schema=parquet_schema,
+                        preserve_index=False,
+                    )
+                    parquet_writer.write_table(table, row_group_size=config.parquet_chunk_size)
+                    wrote_parquet_rows = True
 
-                    open_us = None
-                    close_us = None
-                    open_unit = None
-                    close_unit = None
-
-                    try:
-                        open_us, open_unit = parse_timestamp_to_us(row_map["Open time"])
-                        timestamp_units[open_unit] += 1
-                        if open_us is None:
-                            record_issue(
-                                "open_time_unknown_unit",
-                                f"{csv_path.name}:{file_row_idx} open_time={row_map['Open time']}",
-                            )
-                    except ValueError:
-                        record_issue(
-                            "open_time_parse_error",
-                            f"{csv_path.name}:{file_row_idx} open_time={row_map['Open time']}",
-                        )
-
-                    try:
-                        close_us, close_unit = parse_timestamp_to_us(row_map["Close time"])
-                        timestamp_units[close_unit] += 1
-                        if close_us is None:
-                            record_issue(
-                                "close_time_unknown_unit",
-                                f"{csv_path.name}:{file_row_idx} close_time={row_map['Close time']}",
-                            )
-                    except ValueError:
-                        record_issue(
-                            "close_time_parse_error",
-                            f"{csv_path.name}:{file_row_idx} close_time={row_map['Close time']}",
-                        )
-
-                    if open_us is not None and prev_open_time_us is not None:
-                        delta = open_us - prev_open_time_us
-                        if delta < 0:
-                            record_issue("timestamp_decrease", f"{csv_path.name}:{file_row_idx} delta_us={delta}")
-                        elif delta == 0:
-                            record_issue(
-                                "timestamp_duplicate",
-                                f"{csv_path.name}:{file_row_idx} duplicate open time",
-                            )
-                        elif expected_interval_us is not None and delta != expected_interval_us:
-                            record_issue(
-                                "timestamp_step_mismatch",
-                                f"{csv_path.name}:{file_row_idx} delta_us={delta}, expected={expected_interval_us}",
-                            )
-                            if delta > expected_interval_us:
-                                record_issue(
-                                    "timestamp_gap",
-                                    f"{csv_path.name}:{file_row_idx} gap_us={delta - expected_interval_us}",
-                                )
-                            else:
-                                record_issue(
-                                    "timestamp_overlap",
-                                    f"{csv_path.name}:{file_row_idx} overlap_us={expected_interval_us - delta}",
-                                )
-
-                    if open_us is not None:
-                        prev_open_time_us = open_us
-
-                    if open_unit is not None and close_unit is not None and open_unit != close_unit:
-                        record_issue(
-                            "open_close_time_unit_mismatch",
-                            f"{csv_path.name}:{file_row_idx} open_unit={open_unit}, close_unit={close_unit}",
-                        )
-
-                    if open_us is not None and close_us is not None:
-                        if close_us < open_us:
-                            record_issue(
-                                "close_before_open",
-                                f"{csv_path.name}:{file_row_idx} open_us={open_us}, close_us={close_us}",
-                            )
-                        if expected_interval_us is not None:
-                            open_resolution = timestamp_unit_resolution_us(open_unit)
-                            close_resolution = timestamp_unit_resolution_us(close_unit)
-                            candidate_resolutions = [
-                                resolution
-                                for resolution in (open_resolution, close_resolution)
-                                if resolution is not None
-                            ]
-                            resolution_us = max(candidate_resolutions) if candidate_resolutions else 1
-                            expected_close = open_us + expected_interval_us - resolution_us
-                            if close_us != expected_close:
-                                record_issue(
-                                    "close_time_mismatch",
-                                    f"{csv_path.name}:{file_row_idx} close_us={close_us}, "
-                                    f"expected_close={expected_close}, resolution_us={resolution_us}",
-                                )
-
-                    try:
-                        open_price = float(row_map["Open"])
-                        high_price = float(row_map["High"])
-                        low_price = float(row_map["Low"])
-                        close_price = float(row_map["Close"])
-
-                        if high_price < low_price:
-                            record_issue(
-                                "ohlc_high_below_low",
-                                f"{csv_path.name}:{file_row_idx} high={high_price}, low={low_price}",
-                            )
-                        if high_price < max(open_price, close_price, low_price):
-                            record_issue(
-                                "ohlc_high_inconsistent",
-                                f"{csv_path.name}:{file_row_idx} open={open_price}, high={high_price}, "
-                                f"low={low_price}, close={close_price}",
-                            )
-                        if low_price > min(open_price, close_price, high_price):
-                            record_issue(
-                                "ohlc_low_inconsistent",
-                                f"{csv_path.name}:{file_row_idx} open={open_price}, high={high_price}, "
-                                f"low={low_price}, close={close_price}",
-                            )
-                    except ValueError:
-                        record_issue(
-                            "ohlc_parse_error",
-                            f"{csv_path.name}:{file_row_idx} open/high/low/close parse failed",
-                        )
-
-                    try:
-                        if float(row_map["Volume"]) < 0:
-                            record_issue("negative_volume", f"{csv_path.name}:{file_row_idx}")
-                    except ValueError:
-                        record_issue("volume_parse_error", f"{csv_path.name}:{file_row_idx}")
-
-                    try:
-                        if int(row_map["Number of trades"]) < 0:
-                            record_issue("negative_trade_count", f"{csv_path.name}:{file_row_idx}")
-                    except ValueError:
-                        record_issue("trades_parse_error", f"{csv_path.name}:{file_row_idx}")
-
-                    if output_format == "csv":
-                        csv_writer.writerow([row_map[col] for col in selected_source_columns])
-                        rows_written += 1
-                    else:
-                        for source_col, output_col in zip(selected_source_columns, output_columns):
-                            parquet_buffer[output_col].append(
-                                coerce_for_parquet(source_col, row_map[source_col])
-                            )
-                        buffer_size += 1
-                        rows_written += 1
-                        if buffer_size >= config.parquet_chunk_size:
-                            table = pa.Table.from_pydict(parquet_buffer, schema=parquet_schema)
-                            parquet_writer.write_table(table)
-                            parquet_buffer = {col: [] for col in output_columns}
-                            buffer_size = 0
-
-        if output_format == "parquet" and buffer_size > 0:
-            table = pa.Table.from_pydict(parquet_buffer, schema=parquet_schema)
-            parquet_writer.write_table(table)
+                rows_written += len(output_chunk)
     finally:
-        if csv_handle is not None:
-            csv_handle.close()
         if parquet_writer is not None:
+            if not wrote_parquet_rows:
+                empty_table = pa.Table.from_arrays(
+                    [pa.array([], type=field.type) for field in parquet_schema],
+                    schema=parquet_schema,
+                )
+                parquet_writer.write_table(empty_table, row_group_size=config.parquet_chunk_size)
             parquet_writer.close()
 
     summary_lines = _build_summary_lines(
@@ -612,6 +932,7 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
         selected_source_columns=selected_source_columns,
         output_columns=output_columns,
         column_renames_applied=column_renames_applied,
+        datetime_columns_converted=datetime_columns_converted,
         selected_csvs=selected_csvs,
         files_processed=files_processed,
         rows_total=rows_total,
@@ -632,6 +953,7 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
         selected_columns=output_columns,
         selected_source_columns=selected_source_columns,
         column_renames_applied=column_renames_applied,
+        datetime_columns_converted=datetime_columns_converted,
         selected_csvs=[item[3] for item in selected_csvs],
         files_processed=files_processed,
         rows_read=rows_total,
