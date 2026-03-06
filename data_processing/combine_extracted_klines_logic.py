@@ -28,6 +28,7 @@ class CombineConfig:
     summary_log_name: str = ""
     keep_columns: list[str] = field(default_factory=list)
     drop_columns: list[str] = field(default_factory=list)
+    column_renames: dict[str, str] = field(default_factory=dict)
     parquet_compression: str = "snappy"
     parquet_chunk_size: int = 200_000
     max_examples_per_issue: int = 15
@@ -41,6 +42,8 @@ class CombineResult:
     combined_output_path: Path
     summary_log_path: Path
     selected_columns: list[str]
+    selected_source_columns: list[str]
+    column_renames_applied: dict[str, str]
     selected_csvs: list[Path]
     files_processed: int
     rows_read: int
@@ -130,6 +133,43 @@ def resolve_output_columns(
     return result
 
 
+def resolve_renamed_columns(
+    selected_columns: list[str],
+    column_renames: dict[str, str],
+) -> tuple[list[str], dict[str, str]]:
+    renames = dict(column_renames)
+
+    unknown_sources = [col for col in renames if col not in KLINE_COLUMNS]
+    if unknown_sources:
+        raise ValueError(f"Unknown COLUMN_RENAMES source columns: {unknown_sources}")
+
+    not_selected = [col for col in renames if col not in selected_columns]
+    if not_selected:
+        raise ValueError(
+            "COLUMN_RENAMES can only rename selected columns. "
+            f"Not selected: {not_selected}"
+        )
+
+    invalid_targets = [
+        source_col
+        for source_col, target_col in renames.items()
+        if not isinstance(target_col, str) or not target_col.strip()
+    ]
+    if invalid_targets:
+        raise ValueError(
+            "COLUMN_RENAMES targets must be non-empty strings. "
+            f"Invalid targets for: {invalid_targets}"
+        )
+
+    output_columns = [renames.get(col, col) for col in selected_columns]
+    if len(output_columns) != len(set(output_columns)):
+        duplicates = sorted({col for col in output_columns if output_columns.count(col) > 1})
+        raise ValueError(f"COLUMN_RENAMES produced duplicate output columns: {duplicates}")
+
+    applied = {col: renames[col] for col in selected_columns if col in renames}
+    return output_columns, applied
+
+
 def coerce_for_parquet(column_name: str, value: str):
     int_cols = {"Open time", "Close time", "Number of trades", "Ignore"}
     float_cols = {
@@ -159,6 +199,14 @@ def coerce_for_parquet(column_name: str, value: str):
 
 def default_extracted_dir(project_root: Path) -> Path:
     return project_root / "downloads" / "test1"
+
+
+def resolve_override_path(project_root: Path, override: Path | None) -> Path | None:
+    if override is None:
+        return None
+    if override.is_absolute():
+        return override
+    return project_root / override
 
 
 def select_extracted_csvs(
@@ -196,7 +244,9 @@ def _build_summary_lines(
     extracted_dir: Path,
     combined_output_path: Path,
     summary_log_path: Path,
-    selected_columns: list[str],
+    selected_source_columns: list[str],
+    output_columns: list[str],
+    column_renames_applied: dict[str, str],
     selected_csvs: list[tuple[datetime, int, str, Path]],
     files_processed: int,
     rows_total: int,
@@ -221,7 +271,9 @@ def _build_summary_lines(
         f"OUTPUT_PATH={combined_output_path}",
         f"SUMMARY_LOG_PATH={summary_log_path}",
         f"EXPECTED_INTERVAL_US={expected_interval_us}",
-        f"SELECTED_COLUMNS={selected_columns}",
+        f"SELECTED_SOURCE_COLUMNS={selected_source_columns}",
+        f"OUTPUT_COLUMNS={output_columns}",
+        f"COLUMN_RENAMES_APPLIED={column_renames_applied}",
         "",
         "[Run Stats]",
         f"FILES_SELECTED={len(selected_csvs)}",
@@ -256,8 +308,10 @@ def _build_summary_lines(
 
 def combine_extracted_klines(config: CombineConfig) -> CombineResult:
     project_root = resolve_project_root(config.project_root)
-    extracted_dir = config.extracted_dir or default_extracted_dir(project_root)
-    output_dir = config.output_dir or extracted_dir
+    extracted_dir_override = resolve_override_path(project_root, config.extracted_dir)
+    output_dir_override = resolve_override_path(project_root, config.output_dir)
+    extracted_dir = extracted_dir_override or default_extracted_dir(project_root)
+    output_dir = output_dir_override or extracted_dir
 
     start_dt = parse_yyyy_mm(config.start_yyyy_mm)
     end_dt = parse_yyyy_mm(config.end_yyyy_mm)
@@ -273,7 +327,11 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
     if output_format not in {"csv", "parquet"}:
         raise ValueError("output_format must be 'csv' or 'parquet'.")
 
-    selected_columns = resolve_output_columns(KLINE_COLUMNS, config.keep_columns, config.drop_columns)
+    selected_source_columns = resolve_output_columns(KLINE_COLUMNS, config.keep_columns, config.drop_columns)
+    output_columns, column_renames_applied = resolve_renamed_columns(
+        selected_columns=selected_source_columns,
+        column_renames=config.column_renames,
+    )
     selected_csvs = select_extracted_csvs(
         extracted_dir=extracted_dir,
         symbol=config.symbol,
@@ -325,7 +383,7 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
         if output_format == "csv":
             csv_handle = combined_output_path.open("w", newline="", encoding="utf-8")
             csv_writer = csv.writer(csv_handle)
-            csv_writer.writerow(selected_columns)
+            csv_writer.writerow(output_columns)
         else:
             try:
                 import pyarrow as pa
@@ -334,10 +392,10 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
                 raise ImportError("Parquet output requires pyarrow. Install it, then rerun.") from exc
 
             parquet_field_types = []
-            for col in selected_columns:
-                if col in {"Open time", "Close time", "Number of trades", "Ignore"}:
-                    parquet_field_types.append((col, pa.int64()))
-                elif col in {
+            for source_col, output_col in zip(selected_source_columns, output_columns):
+                if source_col in {"Open time", "Close time", "Number of trades", "Ignore"}:
+                    parquet_field_types.append((output_col, pa.int64()))
+                elif source_col in {
                     "Open",
                     "High",
                     "Low",
@@ -347,9 +405,9 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
                     "Taker buy base asset volume",
                     "Taker buy quote asset volume",
                 }:
-                    parquet_field_types.append((col, pa.float64()))
+                    parquet_field_types.append((output_col, pa.float64()))
                 else:
-                    parquet_field_types.append((col, pa.string()))
+                    parquet_field_types.append((output_col, pa.string()))
 
             parquet_schema = pa.schema(parquet_field_types)
             parquet_writer = pq.ParquetWriter(
@@ -357,7 +415,7 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
                 parquet_schema,
                 compression=config.parquet_compression,
             )
-            parquet_buffer = {col: [] for col in selected_columns}
+            parquet_buffer = {col: [] for col in output_columns}
 
         prev_open_time_us = None
 
@@ -522,17 +580,19 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
                         record_issue("trades_parse_error", f"{csv_path.name}:{file_row_idx}")
 
                     if output_format == "csv":
-                        csv_writer.writerow([row_map[col] for col in selected_columns])
+                        csv_writer.writerow([row_map[col] for col in selected_source_columns])
                         rows_written += 1
                     else:
-                        for col in selected_columns:
-                            parquet_buffer[col].append(coerce_for_parquet(col, row_map[col]))
+                        for source_col, output_col in zip(selected_source_columns, output_columns):
+                            parquet_buffer[output_col].append(
+                                coerce_for_parquet(source_col, row_map[source_col])
+                            )
                         buffer_size += 1
                         rows_written += 1
                         if buffer_size >= config.parquet_chunk_size:
                             table = pa.Table.from_pydict(parquet_buffer, schema=parquet_schema)
                             parquet_writer.write_table(table)
-                            parquet_buffer = {col: [] for col in selected_columns}
+                            parquet_buffer = {col: [] for col in output_columns}
                             buffer_size = 0
 
         if output_format == "parquet" and buffer_size > 0:
@@ -549,7 +609,9 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
         extracted_dir=extracted_dir,
         combined_output_path=combined_output_path,
         summary_log_path=summary_log_path,
-        selected_columns=selected_columns,
+        selected_source_columns=selected_source_columns,
+        output_columns=output_columns,
+        column_renames_applied=column_renames_applied,
         selected_csvs=selected_csvs,
         files_processed=files_processed,
         rows_total=rows_total,
@@ -567,7 +629,9 @@ def combine_extracted_klines(config: CombineConfig) -> CombineResult:
         output_dir=output_dir,
         combined_output_path=combined_output_path,
         summary_log_path=summary_log_path,
-        selected_columns=selected_columns,
+        selected_columns=output_columns,
+        selected_source_columns=selected_source_columns,
+        column_renames_applied=column_renames_applied,
         selected_csvs=[item[3] for item in selected_csvs],
         files_processed=files_processed,
         rows_read=rows_total,
